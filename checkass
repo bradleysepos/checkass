@@ -1,0 +1,591 @@
+#!/bin/bash
+# checkass - verify local and remote assets by multiple checksums
+#
+# Copyright 2017 Bradley Sepos
+# Released under the MIT License. See LICENSE for details.
+# https://github.com/bradleysepos/checkass
+
+NAME="checkass"
+VERSION="0.0.0"
+SELF="${BASH_SOURCE[0]}"
+SELF_DIR=$(cd $(dirname "${BASH_SOURCE[0]}") && pwd -P)
+SELF_DIR="${SELF_DIR:-$(pwd)}"
+SELF_NAME=$(basename "${SELF}")
+SYS_NAME=$(uname | awk '{ print tolower($0)}')
+HELP="\
+usage: ${SELF_NAME} [-h | --help]
+       ${SELF_NAME} [-v | --version]
+       ${SELF_NAME} [-a | --algorithms algo1,algo2] [config_file]
+where:
+  -h, --help
+        display this help text
+  -v, --version
+        display version information
+  -a, --algorithms
+        specify algorithms -- md5, sha1, sha256 (default), sha512, size
+
+algorithms:
+  md5
+        calculate 128-bit checksum using the MD5 hash algorithm
+  sha1
+        calculate 160-bit checksum using the SHA-1 hash algorithm
+  sha256
+        calculate 256-bit checksum using the SHA-256 hash algorithm
+  sha512
+        calculate 512-bit checksum using the SHA-512 hash algorithm
+  size
+        file size in bytes -- assets are verified by comparing the
+        Content-Length header retrieved by curl (fast but not secure)"
+
+# checks for required external tool
+function dependency_exists {  # dependency_exists dep
+    local DEP ERROR
+    DEP="${1:-}"; [[ "${DEP}" == "" ]] && return 1
+    ERROR=false
+    if echo "${DEP}" | grep '/' >/dev/null 2>&1 && [[ ! -x "${DEP}" ]]; then
+        echo "Unable to find command: ${DEP}" >&2
+        ERROR=true
+    elif ! hash "${DEP}" >/dev/null 2>&1; then
+        echo "Unable to find command: ${DEP}" >&2
+        ERROR=true
+    fi
+    [[ "${ERROR}" == true ]] && return 1
+    return 0
+}
+
+# prints dependency requirements
+function print_dependency {  # print_dependency name url required_version found_version
+    local NAME URL VERSION FOUND
+    NAME="${1:-}"; [[ "${NAME}" == "" ]] && return 1
+    URL="${2:-}"
+    VERSION="${3:-}"
+    FOUND="${4:-}"
+    echo -n "${NAME}" >&2
+    if [[ "${VERSION}" != "" ]]; then
+        echo -n " version ${VERSION} or later" >&2
+    fi
+    echo -n " is required" >&2
+    if [[ "${FOUND}" != "" ]]; then
+        echo -n " (found version ${FOUND})" >&2
+    fi
+    if [[ "${URL}" != "" ]]; then
+        echo -n ": ${URL}" >&2
+    fi
+    echo >&2
+}
+
+# creates bash variables from yaml records
+# extended to support arrays, empty values, and more
+# https://gist.github.com/DinoChiesa/3e3c3866b51290f31243
+# https://gist.github.com/epiloque/8cf512c6d64641bde388
+# https://gist.github.com/pkuczynski/8665367
+function parse_yaml {  # parse_yaml yaml_string_or_file variables_prefix spaces_per_indentation
+    local INPUT PREFIX INDENT S W FS
+    INPUT="${1:-}"
+    [[ "${INPUT}" == "" ]] && return 0
+    if [[ -f "${INPUT}" ]] && [[ -r "${INPUT}" ]]; then
+        INPUT=$(<"${INPUT}")
+    fi
+    PREFIX="${2:-}"
+    INDENT="${3:-}"
+    if [[ ! "${INDENT}" =~ '^[0-9]+$' ]] || [[ ! "${INDENT}" -eq 0 ]]; then
+        INDENT=2
+    fi
+    S='[[:space:]]*'
+    W='[a-zA-Z0-9_]*'
+    FS=$(echo @|tr @ '\034')
+    echo "${INPUT}" |
+    sed -n \
+        -e "s|^\(\(${S}\)\(-\) \)\{1\}\(${S}\)\(${W}\)${S}:${S}\(\".*\"\)\${S}\$|\3${FS}\2  \4${FS}\5${FS}\6|p" \
+        -e "s|^\(\(${S}\)\(-\) \)\{1\}\(${S}\)\(${W}\)${S}:${S}\(.*\)${S}\$|\3${FS}\2  \4${FS}\5${FS}\6|p" \
+        -e "s|^\(\(${S}\)\(-\) \)\{1\}\(${S}\)\(\".*\"\)${S}\$|\3${FS}\2  \4${FS}${FS}\5|p" \
+        -e "s|^\(\(${S}\)\(-\) \)\{1\}\(${S}\)\([^:].*\)${S}\$|\3${FS}\2  \4${FS}${FS}\5|p" \
+        -e "s|^\(${S}\)\(${W}\)${S}:${S}\(\".*\"\)${S}\$|${FS}\1${FS}\2${FS}\3|p" \
+        -e "s|^\(${S}\)\(${W}\)${S}:${S}\(.*\)${S}\$|${FS}\1${FS}\2${FS}\3|p" |
+    awk -F"${FS}" \
+        '#
+        # parse_csv, public domain, http://lorance.freeshell.org/csv/
+        #**************************************************************************
+        #
+        # This file is in the public domain.
+        #
+        # For more information email LoranceStinson+csv@gmail.com.
+        # Or see http://lorance.freeshell.org/csv/
+        #
+        # Parse a CSV string into an array.
+        # The number of fields found is returned.
+        # In the event of an error a negative value is returned and csverr is set to
+        # the error. See below for the error values.
+        #
+        # Parameters:
+        # string  = The string to parse.
+        # csv     = The array to parse the fields into.
+        # sep     = The field separator character. Normally ,
+        # quote   = The string quote character. Normally "
+        # escape  = The quote escape character. Normally "
+        # newline = Handle embedded newlines. Provide either a newline or the
+        #           string to use in place of a newline. If left empty embedded
+        #           newlines cause an error.
+        # trim    = When true spaces around the separator are removed.
+        #           This affects parsing. Without this a space between the
+        #           separator and quote result in the quote being ignored.
+        #
+        # These variables are private:
+        # fields  = The number of fields found thus far.
+        # pos     = Where to pull a field from the string.
+        # strtrim = True when a string is found so we know to remove the quotes.
+        #
+        # Error conditions:
+        # -1  = Unable to read the next line.
+        # -2  = Missing end quote.
+        # -3  = Missing separator.
+        #
+        # Notes:
+        # The code assumes that every field is preceded by a separator, even the
+        # first field. This makes the logic much simpler, but also requires a
+        # separator be prepended to the string before parsing.
+        function parse_csv(string,csv,sep,quote,escape,newline,trim, fields,pos,strtrim) {
+            # Make sure there is something to parse.
+            if (length(string) == 0) return 0;
+            string = sep string; # The code below assumes ,FIELD.
+            fields = 0; # The number of fields found thus far.
+            while (length(string) > 0) {
+                # Remove spaces after the separator if requested.
+                if (trim && substr(string, 2, 1) == " ") {
+                    if (length(string) == 1) return fields;
+                    string = substr(string, 2);
+                    continue;
+                }
+                strtrim = 0; # Used to trim quotes off strings.
+                # Handle a quoted field.
+                if (substr(string, 2, 1) == quote) {
+                    pos = 2;
+                    do {
+                        pos++
+                        if (pos != length(string) &&
+                            substr(string, pos, 1) == escape &&
+                            (substr(string, pos + 1, 1) == quote ||
+                             substr(string, pos + 1, 1) == escape)) {
+                            # Remove escaped quote characters.
+                            string = substr(string, 1, pos - 1) substr(string, pos + 1);
+                        } else if (substr(string, pos, 1) == quote) {
+                            # Found the end of the string.
+                            strtrim = 1;
+                        } else if (newline && pos >= length(string)) {
+                            # Handle embedded newlines if requested.
+                            if (getline == -1) {
+                                csverr = "Unable to read the next line.";
+                                return -1;
+                            }
+                            string = string newline $0;
+                        }
+                    } while (pos < length(string) && strtrim == 0)
+                    if (strtrim == 0) {
+                        csverr = "Missing end quote.";
+                        return -2;
+                    }
+                } else {
+                    # Handle an empty field.
+                    if (length(string) == 1 || substr(string, 2, 1) == sep) {
+                        csv[fields] = "";
+                        fields++;
+                        if (length(string) == 1)
+                            return fields;
+                        string = substr(string, 2);
+                        continue;
+                    }
+                    # Search for a separator.
+                    pos = index(substr(string, 2), sep);
+                    # If there is no separator the rest of the string is a field.
+                    if (pos == 0) {
+                        csv[fields] = substr(string, 2);
+                        fields++;
+                        return fields;
+                    }
+                }
+                # Remove spaces after the separator if requested.
+                if (trim && pos != length(string) && substr(string, pos + strtrim, 1) == " ") {
+                    trim = strtrim
+                    # Count the number fo spaces found.
+                    while (pos < length(string) && substr(string, pos + trim, 1) == " ") {
+                        trim++
+                    }
+                    # Remove them from the string.
+                    string = substr(string, 1, pos + strtrim - 1) substr(string,  pos + trim);
+                    # Adjust pos with the trimmed spaces if a quotes string was not found.
+                    if (!strtrim) {
+                        pos -= trim;
+                    }
+                }
+                # Make sure we are at the end of the string or there is a separator.
+                if ((pos != length(string) && substr(string, pos + 1, 1) != sep)) {
+                    csverr = "Missing separator.";
+                    return -3;
+                }
+                # Gather the field.
+                csv[fields] = substr(string, 2 + strtrim, pos - (1 + strtrim * 2));
+                fields++;
+                # Remove the field from the string for the next pass.
+                string = substr(string, pos + 1);
+            }
+            return fields;
+        }
+        BEGIN { prefix = "'"${PREFIX}"'"; indent = '"${INDENT}"'; prev_level = 0; }
+        {
+            type  = $1;
+            level = length($2)/indent;
+            key   = $3;
+            val   = $4;
+            out   = "";
+            array = 0;
+            if (level < prev_level) { adepth[prev_level] = -1; }
+            if (adepth[level] == "") { adepth[level] = -1; }
+            if (type == "-") { adepth[level]++; }
+            vname[level] = key;
+            for (i in vname) {
+                if (i > (level)) { vname[i] = ""; }
+            }
+            for (i = 0; i < level; i++) {
+                if (vname[i] != "") {
+                    out = out "_" vname[i];
+                    if (adepth[i] > -1) { out = out "_" adepth[i+1]; }
+                } else {
+                    out = out "_" adepth[i+1];
+                }
+            }
+            if (substr(val,1,1) == "[" && substr(val,length(val),1) == "]") {
+                array = 1;
+                gsub(/^\[[ ]*/, "", val);
+                gsub(/[ ]*\]$/, "", val);
+                num_vals = parse_csv(val, vals, ",", "\"", "\"", "\\n", 1);
+                if (num_vals < 0) {
+                    # Error parsing inline array
+                    exit 1;
+                }
+            } else {
+                if (substr(val,1,1) == "\"" && substr(val,length(val),1) == "\"") {
+                    num_vals = parse_csv(val, vals, "'"${FS}"'", "\"", "\"", "\\n", 0);
+                    if (num_vals < 0) {
+                        # Error parsing
+                        exit 1;
+                    }
+                } else {
+                    vals[1] = val;
+                }
+            }
+            if (key != "") { out = out "_" key; }
+            out = prefix out;
+            gsub(/__/, "_", out);
+            gsub(/_=/, "", out);
+            #for (i = 1; i <= length(vals); i++) {
+            for (i in vals) {
+                gsub(/"/, "\\\"", vals[i]);
+                if (vals[i] != "true" && vals[i] != "false") {
+                    vals[i]="\"" vals[i] "\""
+                }
+                if (array == 1) {
+                    print out "_" i "=" vals[i];
+                } else {
+                    print out "=" vals[i];
+                }
+            }
+            delete vals;
+            prev_level = level;
+        }'
+}
+
+# tests whether a string is an exact match for an array item
+function in_array {  # in_array needle haystack[@]
+    local e
+    for e in "${@:2}"; do
+        [[ "${e}" == "${1}" ]] && return 0;
+    done
+    return 1
+}
+
+# args
+ALGORITHMS=()
+SUPPORTED=('md5' 'sha1' 'sha256' 'sha512' 'size')
+OPTIND=1
+OPTSPEC=":-:hva:"
+OPTARRAY=('-h' '--help' '-v' '--version' '-a' '--algorithms')  # all short and long options
+while getopts "${OPTSPEC}" OPT; do
+    case "${OPT}" in
+        -)
+            case "${OPTARG}" in
+                help)
+                    # Print help and exit
+                    echo -e "${HELP}"
+                    exit 0
+                    ;;
+                help=*)
+                    # Print help and exit
+                    echo -e "${HELP}"
+                    exit 0
+                    ;;
+                version)
+                    # Print version and exit
+                    echo -e "${NAME} ${VERSION}"
+                    exit 0
+                    ;;
+                version=*)
+                    # Print version and exit
+                    echo -e "${NAME} ${VERSION}"
+                    exit 0
+                    ;;
+                algorithms)
+                    if [[ -z ${!OPTIND+isset} ]] || in_array "${!OPTIND}" "${OPTARRAY[@]}"; then
+                        # Option without required argument
+                        echo "Option --${OPTARG} requires a value" >&2
+                        echo -e "${HELP}"
+                        exit 1
+                    fi
+                    ALGORITHMS="${!OPTIND}"
+                    ALGORITHMS=(${ALGORITHMS//,/ })
+                    for ALGORITHM in ${ALGORITHMS[@]}; do
+                        if ! in_array "${ALGORITHM}" "${SUPPORTED[@]}"; then
+                            # Invalid value
+                            echo "Invalid value for option --${OPTARG}" >&2
+                            echo -e "${HELP}"
+                            exit 1
+                        fi
+                    done
+                    OPTIND=$((OPTIND + 1))
+                    ;;
+                algorithms=*)
+                    ALGORITHMS="${OPTARG#*=}"
+                    ALGORITHMS=(${ALGORITHMS//,/ })
+                    for ALGORITHM in ${ALGORITHMS[@]}; do
+                        if ! in_array "${ALGORITHM}" "${SUPPORTED[@]}"; then
+                            # Invalid value
+                            echo "Invalid value for option --${OPTARG}" >&2
+                            echo -e "${HELP}"
+                            exit 1
+                        fi
+                    done
+                    ;;
+                *)
+                    if [[ "${OPTERR}" == 1 ]]; then
+                        # Invalid option specified
+                        echo "Invalid option: --${OPTARG}" >&2
+                        echo -e "${HELP}"
+                        exit 1
+                    fi
+                    ;;
+            esac
+            ;;
+        h)
+            # Print help and exit
+            echo -e "${HELP}"
+            exit 0
+            ;;
+        v)
+            # Print version and exit
+            echo "${NAME} ${VERSION}"
+            exit 0
+            ;;
+        a)
+            # Algorithm
+            ALGORITHMS="${OPTARG}"
+            ALGORITHMS=(${ALGORITHMS//,/ })
+            for ALGORITHM in ${ALGORITHMS[@]}; do
+                if ! in_array "${ALGORITHM}" "${SUPPORTED[@]}"; then
+                    # Invalid value
+                    echo "Invalid value for option --${OPTARG}" >&2
+                    echo -e "${HELP}"
+                    exit 1
+                fi
+            done
+            ;;
+        :)
+            # Option without required value
+            echo "Option -${OPTARG} requires a value" >&2
+            echo -e "${HELP}"
+            exit 1
+            ;;
+        \?)
+            # Invalid option specified
+            echo "Invalid option: -${OPTARG}" >&2
+            echo -e "${HELP}"
+            exit 1
+            ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+# dependencies
+MD5="md5sum"
+if [[ "${SYS_NAME}" == "darwin" ]]; then
+    MD5="md5"
+fi
+DEPS_MISSING=()
+dependency_exists "curl" || DEPS_MISSING+=("curl")
+dependency_exists "${MD5}" || DEPS_MISSING+=("${MD5}")
+dependency_exists "shasum" || DEPS_MISSING+=("shasum")
+if [[ "${#DEPS_MISSING[@]}" -gt 0 ]]; then
+    in_array "curl" "${DEPS_MISSING[@]}" && print_dependency "curl"
+    in_array "${MD5}" "${DEPS_MISSING[@]}" && print_dependency "md5sum (md5 on Darwin/macOS)"
+    in_array "shasum" "${DEPS_MISSING[@]}" && print_dependency "shasum"
+    exit 1
+fi
+if [[ "${SYS_NAME}" == "darwin" ]]; then
+    MD5="md5 -r"
+fi
+
+# parse config
+if [[ "${CHECKASS_CONFIG_FILE:-}" == "" ]]; then
+    CHECKASS_CONFIG_FILE="${1:-}"
+    if [[ "${CHECKASS_CONFIG_FILE}" == "" ]]; then
+        echo "Configuration file not specified." >&2
+        echo -e "${HELP}"
+        exit 1
+    fi
+    if [[ -f "${CHECKASS_CONFIG_FILE}" ]] && [[ -r "${CHECKASS_CONFIG_FILE}" ]]; then
+        CHECKASS_CONFIG=$(parse_yaml "${CHECKASS_CONFIG_FILE}" "CHECKASS_CONFIG_")
+        [[ $? -ne 0 ]] && echo "Unable to parse yaml file: ${CHECKASS_CONFIG_FILE}" >&2 && return 1
+        eval "${CHECKASS_CONFIG}"
+    else
+        echo "Configuration file not found: ${CHECKASS_CONFIG_FILE#$SELF_DIR/}" >&2
+        exit 1
+    fi
+fi
+
+# create temp dir
+CHECKASS_TEMP=""
+if [[ "${ALGORITHMS[*]}" != "size" ]]; then
+    CHECKASS_TEMP=$(mktemp -d "${TMPDIR:-/tmp/}checkass-XXXXXX")
+    if [[ ! -w "${CHECKASS_TEMP}" ]]; then
+        echo "Error creating temporary files." >&2
+        exit 1
+    fi
+fi
+
+# kills child processes and removes temporary files
+function die_gracefully {  # die_gracefully
+    trap - EXIT INT
+    trap ":" INT  # prevent recursion due to spamming ctrl-c
+    echo "Killing all processes and cleaning up (ETA ~3 seconds)..." >&2
+    sleep 2
+    if [[ "${CHECKASS_TEMP}" != "" ]]; then
+        rm -rf "${CHECKASS_TEMP}" || "Temporary files may still remain at: ${CHECKASS_TEMP}" >&2
+    fi
+    sleep 1
+    trap - TERM && kill -- -$$
+}
+
+# die gracefully
+trap "die_gracefully" EXIT INT TERM
+
+EXIT_CODE=0
+II=-1
+while : ; do
+    II=$((II+1))
+    ASSET_SIZE="CHECKASS_CONFIG_Assets_${II}_Size"
+    ASSET_MD5="CHECKASS_CONFIG_Assets_${II}_MD5"
+    ASSET_SHA1="CHECKASS_CONFIG_Assets_${II}_SHA1"
+    ASSET_SHA256="CHECKASS_CONFIG_Assets_${II}_SHA256"
+    ASSET_SHA512="CHECKASS_CONFIG_Assets_${II}_SHA512"
+    ASSET_URL="CHECKASS_CONFIG_Assets_${II}_URLs_0"
+
+    # emulate do-while loop
+    [[ "${!ASSET_URL:-}" != "" ]] || break
+
+    # loop over asset urls
+    JJ=0
+    ASSET_URL="CHECKASS_CONFIG_Assets_${II}_URLs_${JJ}"
+    while [[ "${!ASSET_URL}" != "" ]]; do
+        ASSET_HASH=$(echo "${!ASSET_URL}" | shasum -a 256)
+        ERROR=false
+        for ALGORITHM in ${ALGORITHMS[@]}; do
+            RESULT=""
+            COMPARE=""
+            case "${ALGORITHM}" in
+                md5)
+                    COMPARE="${!ASSET_MD5:-DEADBEEF}"
+                    ;;
+                sha1)
+                    COMPARE="${!ASSET_SHA1:-DEADBEEF}"
+                    ;;
+                sha256)
+                    COMPARE="${!ASSET_SHA256:-DEADBEEF}"
+                    ;;
+                sha512)
+                    COMPARE="${!ASSET_SHA512:-DEADBEEF}"
+                    ;;
+                size)
+                    COMPARE="${!ASSET_SIZE:-DEADBEEF}"
+                    ;;
+                *)
+                    COMPARE="${!ASSET_SHA256:-DEADBEEF}"
+                    ;;
+            esac
+            if [[ "${COMPARE}" != "DEADBEEF" ]]; then
+                if [[ "${ALGORITHM}" != "size" ]] && [[ ! -e "${CHECKASS_TEMP}/${ASSET_HASH}" ]]; then
+                    # fetch header
+                    if ! curl --silent "${!ASSET_URL}" -o "${CHECKASS_TEMP}/${ASSET_HASH}"; then
+                        # delayed resume on failure
+                        sleep 1
+                        if ! curl --silent "${!ASSET_URL}" -o "${CHECKASS_TEMP}/${ASSET_HASH}" -C -; then
+                            # hard fail
+                            ERROR=true
+                            echo "[EROR]"$'\t'"${!ASSET_URL}" >&2
+                            if [[ "${EXIT_CODE}" -ne 6 ]]; then
+                                EXIT_CODE=1
+                            fi
+                            continue 3
+                        fi
+                    fi
+                fi
+                case "${ALGORITHM}" in
+                    md5)
+                        RESULT=$("${MD5}" "${CHECKASS_TEMP}/${ASSET_HASH}" | awk '{ print $1 }')
+                        ;;
+                    sha1)
+                        RESULT=$(shasum -a 1 "${CHECKASS_TEMP}/${ASSET_HASH}" | awk '{ print $1 }')
+                        ;;
+                    sha256)
+                        RESULT=$(shasum -a 256 "${CHECKASS_TEMP}/${ASSET_HASH}" | awk '{ print $1 }')
+                        ;;
+                    sha512)
+                        RESULT=$(shasum -a 512 "${CHECKASS_TEMP}/${ASSET_HASH}" | awk '{ print $1 }')
+                        ;;
+                    size)
+                        RESULT=$(curl --silent --head "${!ASSET_URL}" | grep 'Content-Length:' | grep -E -o [0-9]+)
+                        ;;
+                    *)
+                        # default to SHA-256
+                        RESULT=$(shasum -a 256 "${CHECKASS_TEMP}/${ASSET_HASH}" | awk '{ print $1 }')
+                        ;;
+                esac
+            fi
+            if [[ "${COMPARE}" == "DEADBEEF" ]]; then
+                # nothing to compare
+                ERROR=true
+                echo "[EROR]"$'\t'"${!ASSET_URL}" >&2
+                if [[ "${EXIT_CODE}" -ne 6 ]]; then
+                    EXIT_CODE=1
+                fi
+                continue 3
+            elif [[ "${COMPARE}" != "${RESULT}" ]]; then
+                # compare failed
+                ERROR=true
+                echo "[FAIL]"$'\t'"${!ASSET_URL}" >&2
+                EXIT_CODE=6
+                continue 3
+            fi
+        done
+        [[ "${ERROR}" == false ]] && echo "[ OK ]"$'\t'"${!ASSET_URL}"
+        rm -f "${CHECKASS_TEMP}/${ASSET_HASH}"
+
+        JJ=$((JJ+1))
+        ASSET_URL="CHECKASS_CONFIG_Assets_${II}_URLs_${JJ}"
+    done
+done
+
+# clean up
+if [[ "${ALGORITHMS[*]}" != "size" ]]; then
+    rm -rf "${CHECKASS_TEMP}"
+fi
+trap - EXIT INT TERM
+
+exit "${EXIT_CODE}"
