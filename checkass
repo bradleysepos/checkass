@@ -391,7 +391,7 @@ while getopts "${OPTSPEC}" OPT; do
             for ALGORITHM in ${ALGORITHMS[@]}; do
                 if ! in_array "${ALGORITHM}" "${SUPPORTED[@]}"; then
                     # Invalid value
-                    echo "Invalid value for option --${OPTARG}" >&2
+                    echo "Invalid value for option -${OPT}" >&2
                     echo -e "${HELP}"
                     exit 1
                 fi
